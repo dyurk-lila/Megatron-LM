@@ -59,6 +59,7 @@ The implementation cleanly separates the replay logic from the router's core com
         *   `set_target_indices()`: A method to load the replay indices into `target_topk_idx` for the forward pass.
         *   `record_indices()`: A method to save the computed indices.
     *   The `topk_routing_with_score_function` is modified to contain the core logic. It checks the `router_replay_action` on the `router_replay` instance and accordingly performs one of the following actions: computes and records indices, replays indices from `target_topk_idx` (for forward), replays indices from `replay_backward_list` (for backward), or falls through to the default dynamic routing.
+    *   Replayed indices replace any other selection, including routers that compute their own (quantile balancing), and work with `moe_router_fusion`: the indices are passed to Transformer Engine's fused router as `precomputed_indices`. With a Transformer Engine that does not accept `precomputed_indices` (or, for `RECORD`, the dense `topk_indices` output), those calls use the unfused router.
 
 ### Training recompute usage
 

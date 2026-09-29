@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+import inspect
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -28,9 +30,11 @@ from megatron.core.transformer.moe.batch_invariant import (
 )
 from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
-from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecated, internal_api, is_te_min_version
+from megatron.core.utils import deprecated, internal_api, is_te_min_version, log_single_rank
+
+logger = logging.getLogger(__name__)
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -765,6 +769,70 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
+@functools.lru_cache(maxsize=None)
+def _fused_router_supports(arg_name: str) -> bool:
+    """Whether the installed TE fused_topk_with_score_function accepts ``arg_name``."""
+    return arg_name in inspect.signature(fused_topk_with_score_function).parameters
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_fused_router_fallback(arg_name: str) -> None:
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"The installed Transformer Engine fused router does not accept `{arg_name}`, which "
+        "routing replay, precomputed selections, and dense outputs need; using the unfused "
+        "router for these calls. Upgrade Transformer Engine to fuse them.",
+    )
+
+
+def _fused_topk_routing(
+    logits: torch.Tensor,
+    topk: int,
+    use_pre_softmax: bool,
+    num_groups: Optional[int],
+    group_topk: Optional[int],
+    scaling_factor: Optional[float],
+    score_function: str,
+    expert_bias: Optional[torch.Tensor],
+    router_replay: Optional['RouterReplay'],
+    dense_output: bool,
+    precomputed_indices: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """TE fused routing with the same outputs as the unfused path of
+    topk_routing_with_score_function. ``router_replay``, if given, records the selection."""
+    kwargs = dict(
+        logits=logits,
+        topk=topk,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=num_groups,
+        group_topk=group_topk,
+        scaling_factor=scaling_factor,
+        score_function=score_function,
+        expert_bias=expert_bias,
+    )
+    if precomputed_indices is not None:
+        precomputed_indices = precomputed_indices.contiguous()
+        probs, routing_map = fused_topk_with_score_function(
+            precomputed_indices=precomputed_indices, **kwargs
+        )
+        top_indices = precomputed_indices
+    elif router_replay is not None or dense_output:
+        top_indices = torch.empty((logits.shape[0], topk), dtype=torch.int64, device=logits.device)
+        probs, _ = fused_topk_with_score_function(topk_indices=top_indices, **kwargs)
+        routing_map = None
+    else:
+        return fused_topk_with_score_function(**kwargs)
+
+    if router_replay is not None:
+        router_replay.record_indices(top_indices)
+    if dense_output:
+        return probs.gather(1, top_indices.long()), top_indices
+    if routing_map is None:
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
+    return probs, routing_map
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -795,17 +863,18 @@ def topk_routing_with_score_function(
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        router_replay (Optional['RouterReplay']): For debugging and development, allows for
-                                             deterministic routing by replaying a previously
-                                             recorded routing sequence.
-
-                                              Defaults to None.
+        router_replay (Optional['RouterReplay']): Records the selected top-k indices, or replays
+                                             previously recorded ones in place of the selection
+                                             (including precomputed_indices). Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
         precomputed_indices (torch.Tensor, optional): Top-k indices [num_tokens, topk]
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
-                                       indices (e.g. for quantile balancing). Defaults to None.
+                                       indices (e.g. for quantile balancing). With fused=True,
+                                       this needs a Transformer Engine that accepts
+                                       precomputed_indices, otherwise the unfused path runs.
+                                       Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -824,9 +893,17 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
-    assert not (
-        fused and precomputed_indices is not None
-    ), "precomputed_indices is not supported with the fused top-k score function."
+
+    # Replayed indices replace any other selection, including a caller's precomputed_indices.
+    if router_replay is not None:
+        replay_indices = router_replay.get_replay_indices()
+        if replay_indices is not None:
+            precomputed_indices = replay_indices.to(logits.device)
+    record = (
+        router_replay is not None
+        and router_replay.router_replay_action == RouterReplayAction.RECORD
+    )
+
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -837,18 +914,29 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
-            logits=logits,
-            topk=topk,
-            use_pre_softmax=use_pre_softmax,
-            num_groups=num_groups,
-            group_topk=group_topk,
-            scaling_factor=scaling_factor,
-            score_function=score_function,
-            expert_bias=expert_bias,
-        )
+        if precomputed_indices is not None:
+            required_arg = "precomputed_indices"
+        elif record or dense_output:
+            required_arg = "topk_indices"
+        else:
+            required_arg = None
+        if required_arg is None or _fused_router_supports(required_arg):
+            return _fused_topk_routing(
+                logits=logits,
+                topk=topk,
+                use_pre_softmax=use_pre_softmax,
+                num_groups=num_groups,
+                group_topk=group_topk,
+                scaling_factor=scaling_factor,
+                score_function=score_function,
+                expert_bias=expert_bias,
+                router_replay=router_replay if record else None,
+                dense_output=dense_output,
+                precomputed_indices=precomputed_indices,
+            )
+        _warn_fused_router_fallback(required_arg)
 
-    def _compute_topk(
+    def compute_topk(
         scores: torch.Tensor,
         topk: int,
         num_groups: Optional[int] = None,
@@ -883,16 +971,6 @@ def topk_routing_with_score_function(
                 k=topk,
                 dim=1,
                 sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
-            )
-
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
-
-        if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-        else:
-            return router_replay.get_replay_topk(
-                scores, topk, num_groups, group_topk, _compute_topk
             )
 
     # Precision notes:
@@ -936,6 +1014,9 @@ def topk_routing_with_score_function(
         probs = probs * scaling_factor
 
     probs = probs.type_as(logits)
+
+    if record:
+        router_replay.record_indices(top_indices)
 
     if dense_output:
         return probs, top_indices

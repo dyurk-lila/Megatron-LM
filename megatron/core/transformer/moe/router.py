@@ -391,9 +391,6 @@ class TopKRouter(Router):
             routing map, each shaped ``[num_tokens, num_experts]``.
         """
         assert (
-            not self.config.moe_router_fusion
-        ), "Quantile balancing routing does not support moe_router_fusion."
-        assert (
             self.config.moe_router_num_groups is None and self.config.moe_router_group_topk is None
         ), "Quantile balancing routing does not support group-limited routing."
 
@@ -448,6 +445,7 @@ class TopKRouter(Router):
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
             fused=self.config.moe_router_fusion,
+            router_replay=self.router_replay,
             precomputed_indices=indices,
         )
 
