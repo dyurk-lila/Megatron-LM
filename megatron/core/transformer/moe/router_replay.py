@@ -164,22 +164,29 @@ class RouterReplay:
             )
             self.record_indices(top_indices)
             return probs, top_indices
-        elif self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            top_indices = self.target_topk_idx
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-        elif self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
-            top_indices = self.replay_backward_list.pop(0)
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-        else:
+        top_indices = self.get_replay_indices()
+        if top_indices is None:
             return default_compute_topk(scores, topk, num_groups, group_topk)
+        # Ensure indices are on the correct device
+        top_indices = top_indices.to(scores.device)
+        # Gather the scores for the replayed indices to get the probabilities
+        probs = scores.gather(1, top_indices)
+        return probs, top_indices
+
+    def get_replay_indices(self) -> Optional[torch.Tensor]:
+        """Returns the top-k indices to replay, or None when this layer is not replaying.
+
+        Under REPLAY_BACKWARD, each call consumes the next entry of the backward replay queue.
+        """
+        if self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
+            if self.target_topk_idx is None:
+                raise RuntimeError("REPLAY_FORWARD requires target indices; call set_replay_data.")
+            return self.target_topk_idx
+        if self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
+            if not self.replay_backward_list:
+                raise RuntimeError("REPLAY_BACKWARD has no remaining indices to replay.")
+            return self.replay_backward_list.pop(0)
+        return None
 
     def set_static_buffer(self, buffer: torch.Tensor):
         """Sets a static buffer for CUDA graph compatible recording.

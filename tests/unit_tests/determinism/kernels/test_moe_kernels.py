@@ -210,6 +210,36 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize("case", sorted(ROUTING_CASES))
+@pytest.mark.parametrize(
+    "fused",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not HAVE_TE_ROUTER or not moe_utils._fused_router_supports("precomputed_indices"),
+                reason="TE fused router with precomputed_indices needed",
+            ),
+        ),
+    ],
+)
+def test_topk_routing_precomputed_indices_replays(case, fused):
+    seeded()
+    kwargs = dict(ROUTING_CASES[case])
+    logits = torch.randn(8192, 256, device="cuda", dtype=torch.float32, requires_grad=True)
+    indices = torch.rand(8192, 256, device="cuda").argsort(dim=-1)[:, : kwargs["topk"]]
+
+    def fn(logits):
+        return moe_utils.topk_routing_with_score_function(
+            logits, fused=fused, precomputed_indices=indices, **kwargs
+        )
+
+    assert_replays_bit_exact(
+        fn, (logits,), replays=3, what=f"topk routing precomputed[{case}, fused={fused}]"
+    )
+
+
 def test_group_limited_topk_replays():
     seeded()
     scores = torch.rand(8192, 256, device="cuda")
